@@ -1,0 +1,15 @@
+{
+  "name": "PuttCam Web",
+  "short_name": "PuttCam",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "icons": [
+    {
+      "src": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAIUlEQVR4nO3BMQEAAADCoPVPbQ0PoAAAAAAAAAAAAAAA4KcB1gAAXyZC0wAAAABJRU5ErkJggg==",
+      "sizes": "64x64",
+      "type": "image/png"
+    }
+  ]
+}
