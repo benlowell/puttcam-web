@@ -1,0 +1,597 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#000000" />
+  <link rel="manifest" href="manifest.json" />
+  <title>PuttCam Web</title>
+  <style>
+    :root { --bg:#000; --fg:#fff; --card:rgba(0,0,0,0.45); }
+    html,body { margin:0; height:100%; background:var(--bg); color:var(--fg); font-family:-apple-system,system-ui,Segoe UI,Roboto,Arial; }
+    #wrap { position:relative; height:100%; overflow:hidden; }
+    video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+    #overlay { pointer-events:none; }
+    #hud {
+      position:absolute; top:12px; left:12px; right:12px; z-index:10;
+      display:flex; gap:10px; justify-content:space-between; align-items:flex-start;
+    }
+    .card {
+      background:var(--card); padding:10px 12px; border-radius:14px;
+      backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+      max-width: 72%;
+    }
+    .status { font-weight:800; letter-spacing:0.5px; }
+    .small { font-size:12px; opacity:0.9; margin-top:6px; line-height:1.25em; }
+    .metric { font-size:13px; margin-top:8px; opacity:0.95; }
+    #controls {
+      position:absolute; left:12px; right:12px; bottom:18px; z-index:11;
+      display:flex; gap:10px; justify-content:center; flex-wrap:wrap;
+    }
+    button {
+      border:none; border-radius:14px; padding:12px 14px;
+      font-size:15px; font-weight:800;
+      background:#fff; color:#000;
+    }
+    button.secondary { background: rgba(255,255,255,0.18); color:#fff; }
+    button:disabled { opacity:0.45; }
+    #roiBox {
+      position:absolute; border:2px dashed rgba(255,255,255,0.85);
+      display:none; z-index:9;
+    }
+    #toast {
+      position:absolute; left:12px; right:12px; bottom:82px; z-index:12;
+      background:rgba(0,0,0,0.6); padding:10px 12px; border-radius:14px;
+      display:none;
+    }
+    #toast span { font-size:13px; opacity:0.95; }
+    a { color:#fff; }
+  </style>
+</head>
+<body>
+<div id="wrap">
+  <video id="video" playsinline muted></video>
+  <canvas id="overlay"></canvas>
+  <div id="roiBox"></div>
+
+  <div id="hud">
+    <div class="card">
+      <div class="status" id="status">READY</div>
+      <div class="small" id="hint">
+        Setup: phone low behind the ball on the target line.<br/>
+        For tracking: put a <b>bright green sticker</b> on the putter head.<br/>
+        Tap <b>Set ROI</b> and drag a box around where the putter head moves.
+      </div>
+      <div class="metric" id="metrics">Backstroke: – | Tempo: – | Ratio: –</div>
+      <div class="metric" id="session">Strokes: 0 | Consistency: –</div>
+    </div>
+
+    <div class="card" style="max-width:42%; text-align:right;">
+      <div class="small">
+        PuttCam Web (free MVP)<br/>
+        Tracking = green sticker<br/>
+        Add to Home Screen for “app mode”
+      </div>
+    </div>
+  </div>
+
+  <div id="toast"><span id="toastText"></span></div>
+
+  <div id="controls">
+    <button id="start">Start Camera</button>
+    <button id="setroi" class="secondary" disabled>Set ROI</button>
+    <button id="analyze" class="secondary" disabled>Analyze Stroke</button>
+    <button id="reset" class="secondary" disabled>Reset Session</button>
+    <button id="swap" class="secondary" disabled>Swap Cam</button>
+  </div>
+</div>
+
+<script>
+/**
+ * PuttCam Web MVP
+ * - iPhone Safari camera preview
+ * - Overlay center line
+ * - Optional green-sticker tracking within user-defined ROI
+ * - Extract: backstroke length (px), back/forward times, tempo ratio, simple consistency
+ *
+ * Notes:
+ * - Pixel units depend on distance to phone. That's OK for training repeatability.
+ * - For best results: bright lighting + neon green sticker/tape.
+ */
+
+const video = document.getElementById('video');
+const overlay = document.getElementById('overlay');
+const ctx = overlay.getContext('2d');
+
+const statusEl = document.getElementById('status');
+const metricsEl = document.getElementById('metrics');
+const sessionEl = document.getElementById('session');
+
+const startBtn = document.getElementById('start');
+const setRoiBtn = document.getElementById('setroi');
+const analyzeBtn = document.getElementById('analyze');
+const resetBtn = document.getElementById('reset');
+const swapBtn = document.getElementById('swap');
+
+const roiBox = document.getElementById('roiBox');
+const toast = document.getElementById('toast');
+const toastText = document.getElementById('toastText');
+
+let stream = null;
+let usingFront = false;
+let rafId = null;
+
+// ROI in video pixel coords
+let roi = null; // {x,y,w,h} in video coords
+
+// Tracking buffers
+let track = []; // {t, x, y, ok} - x,y are centroid in ROI coords (video pixels)
+let isTracking = false;
+
+// Session strokes
+let strokes = []; // {backPx, backTime, fwdTime, ratio}
+
+function showToast(msg, ms=1800){
+  toastText.textContent = msg;
+  toast.style.display = 'block';
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(()=> toast.style.display='none', ms);
+}
+
+function resizeCanvas(){
+  overlay.width = Math.floor(window.innerWidth * devicePixelRatio);
+  overlay.height = Math.floor(window.innerHeight * devicePixelRatio);
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+function drawOverlay(){
+  const w = overlay.width, h = overlay.height;
+  ctx.clearRect(0,0,w,h);
+
+  // Center line (target line)
+  ctx.globalAlpha = 0.55;
+  ctx.fillStyle = '#fff';
+  const lw = Math.max(2, Math.floor(2 * devicePixelRatio));
+  ctx.fillRect((w - lw)/2, 0, lw, h);
+
+  // ROI hint rectangle (screen coords) if set
+  if (roi) {
+    const r = roiToScreenRect(roi);
+    ctx.globalAlpha = 0.22;
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.globalAlpha = 0.95;
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+    ctx.lineWidth = Math.max(2, Math.floor(2 * devicePixelRatio));
+    ctx.strokeRect(r.x, r.y, r.w, r.h);
+  }
+
+  // Live tracked point (screen coords)
+  if (track.length && roi) {
+    const last = track[track.length - 1];
+    if (last.ok) {
+      const p = roiPointToScreen(last.x, last.y);
+      ctx.globalAlpha = 0.9;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 8 * devicePixelRatio, 0, Math.PI*2);
+      ctx.fillStyle = 'rgba(255,255,255,0.9)';
+      ctx.fill();
+    }
+  }
+
+  ctx.globalAlpha = 1.0;
+}
+
+// Map ROI (video coords) to screen coords for drawing
+function roiToScreenRect(r){
+  // video is cover-fit; compute displayed video rect
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const sw = window.innerWidth, sh = window.innerHeight;
+  if (!vw || !vh) return {x:0,y:0,w:0,h:0};
+
+  const videoAspect = vw / vh;
+  const screenAspect = sw / sh;
+
+  let drawW, drawH, offX, offY;
+  if (videoAspect > screenAspect) {
+    // video wider than screen: height fits, width crops
+    drawH = sh; drawW = sh * videoAspect;
+    offX = (sw - drawW)/2; offY = 0;
+  } else {
+    // video taller: width fits, height crops
+    drawW = sw; drawH = sw / videoAspect;
+    offX = 0; offY = (sh - drawH)/2;
+  }
+
+  const sx = offX + (r.x / vw) * drawW;
+  const sy = offY + (r.y / vh) * drawH;
+  const swr = (r.w / vw) * drawW;
+  const shr = (r.h / vh) * drawH;
+
+  return { x: sx * devicePixelRatio, y: sy * devicePixelRatio, w: swr * devicePixelRatio, h: shr * devicePixelRatio };
+}
+
+function roiPointToScreen(rx, ry){
+  // rx,ry are within ROI in video pixels offset from roi.x/roi.y
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return {x:0,y:0};
+
+  const pVideoX = roi.x + rx;
+  const pVideoY = roi.y + ry;
+
+  const sw = window.innerWidth, sh = window.innerHeight;
+
+  const videoAspect = vw / vh;
+  const screenAspect = sw / sh;
+
+  let drawW, drawH, offX, offY;
+  if (videoAspect > screenAspect) {
+    drawH = sh; drawW = sh * videoAspect;
+    offX = (sw - drawW)/2; offY = 0;
+  } else {
+    drawW = sw; drawH = sw / videoAspect;
+    offX = 0; offY = (sh - drawH)/2;
+  }
+
+  const sx = offX + (pVideoX / vw) * drawW;
+  const sy = offY + (pVideoY / vh) * drawH;
+
+  return { x: sx * devicePixelRatio, y: sy * devicePixelRatio };
+}
+
+async function startCamera(){
+  try {
+    if (stream) stream.getTracks().forEach(t => t.stop());
+
+    const constraints = {
+      audio: false,
+      video: {
+        facingMode: usingFront ? "user" : "environment",
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+        frameRate: { ideal: 60, max: 60 }
+      }
+    };
+
+    stream = await navigator.mediaDevices.getUserMedia(constraints);
+    video.srcObject = stream;
+    await video.play();
+
+    statusEl.textContent = "LIVE";
+    setRoiBtn.disabled = false;
+    analyzeBtn.disabled = false;
+    resetBtn.disabled = false;
+    swapBtn.disabled = false;
+
+    // Start render loop
+    startRenderLoop();
+    showToast("Camera started. Tap “Set ROI” and drag around putter area.");
+  } catch (e) {
+    console.error(e);
+    alert("Camera failed. Make sure Safari has camera permission.");
+  }
+}
+
+function startRenderLoop(){
+  const step = () => {
+    if (isTracking) trackFrame();
+    drawOverlay();
+    rafId = requestAnimationFrame(step);
+  };
+  cancelAnimationFrame(rafId);
+  step();
+}
+
+// Tracking: find neon green pixels in ROI and return centroid
+// HSV threshold tuned for bright green tape.
+// You can adjust if you use a different color.
+function trackFrame(){
+  if (!roi || !video.videoWidth) return;
+
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const rx = Math.max(0, Math.min(vw-1, Math.floor(roi.x)));
+  const ry = Math.max(0, Math.min(vh-1, Math.floor(roi.y)));
+  const rw = Math.max(1, Math.min(vw-rx, Math.floor(roi.w)));
+  const rh = Math.max(1, Math.min(vh-ry, Math.floor(roi.h)));
+
+  // Draw ROI into a tiny canvas for speed
+  if (!trackFrame._c) {
+    trackFrame._c = document.createElement('canvas');
+    trackFrame._x = trackFrame._c.getContext('2d', { willReadFrequently: true });
+  }
+  const c = trackFrame._c, x = trackFrame._x;
+  c.width = rw;
+  c.height = rh;
+  x.drawImage(video, rx, ry, rw, rh, 0, 0, rw, rh);
+
+  const img = x.getImageData(0, 0, rw, rh);
+  const d = img.data;
+
+  let sumX=0, sumY=0, count=0;
+
+  // quick green detection (RGB-based + simple "green dominance")
+  for (let i=0; i<d.length; i+=4) {
+    const r = d[i], g = d[i+1], b = d[i+2];
+
+    // Heuristic: neon green => high G, relatively low R/B, and strong G dominance
+    if (g > 140 && g > r * 1.4 && g > b * 1.4 && r < 140 && b < 140) {
+      const px = (i/4) % rw;
+      const py = Math.floor((i/4) / rw);
+      sumX += px;
+      sumY += py;
+      count++;
+    }
+  }
+
+  const t = performance.now();
+
+  if (count > 40) { // require enough pixels to avoid noise
+    const cx = sumX / count;
+    const cy = sumY / count;
+    track.push({ t, x: cx, y: cy, ok: true });
+  } else {
+    track.push({ t, x: 0, y: 0, ok: false });
+  }
+
+  // keep last ~6 seconds
+  while (track.length && (t - track[0].t) > 6000) track.shift();
+}
+
+function analyzeStroke(){
+  if (!roi) {
+    showToast("Set ROI first (drag a box around the putter head movement).");
+    return;
+  }
+
+  // Turn tracking on for a short capture window (user makes 1 putt)
+  track = [];
+  isTracking = true;
+  statusEl.textContent = "CAPTURING…";
+  showToast("Make ONE putt now (about 2–3 seconds).", 2200);
+
+  setTimeout(() => {
+    isTracking = false;
+    statusEl.textContent = "LIVE";
+    const result = computeMetrics(track);
+    if (!result) {
+      showToast("No reliable track found. More light or brighter green sticker.");
+      return;
+    }
+    strokes.push(result);
+    renderMetrics(result);
+    renderSession();
+  }, 2600);
+}
+
+function computeMetrics(samples){
+  // Filter to valid points
+  const pts = samples.filter(s => s.ok);
+  if (pts.length < 12) return null;
+
+  // Use X position in ROI to infer backstroke & forward stroke
+  // Smooth x with a small moving average
+  const xs = pts.map(p => p.x);
+  const ts = pts.map(p => p.t);
+  const smooth = xs.map((_,i)=>{
+    let a=0,c=0;
+    for (let k=-2;k<=2;k++){
+      const j=i+k;
+      if (j>=0 && j<xs.length){ a+=xs[j]; c++; }
+    }
+    return a/c;
+  });
+
+  // Find extremes: assume start near middle, backswing reaches max deviation, then returns
+  // Determine which direction is "back" by looking at first big trend
+  const dx1 = smooth[Math.min(8, smooth.length-1)] - smooth[0];
+  const backIsRight = dx1 > 0;
+
+  let backIndex = 0;
+  if (backIsRight) {
+    let maxVal = -Infinity;
+    for (let i=0;i<smooth.length;i++){
+      if (smooth[i] > maxVal) { maxVal = smooth[i]; backIndex = i; }
+    }
+  } else {
+    let minVal = Infinity;
+    for (let i=0;i<smooth.length;i++){
+      if (smooth[i] < minVal) { minVal = smooth[i]; backIndex = i; }
+    }
+  }
+
+  // Start index: earliest stable point before the back peak
+  const startIndex = 0;
+
+  // "Impact" proxy: when it returns near start position after peak
+  const startX = smooth[startIndex];
+  let impactIndex = -1;
+  const tol = 8; // pixels tolerance in ROI space
+  for (let i=backIndex+1;i<smooth.length;i++){
+    if (Math.abs(smooth[i] - startX) <= tol) { impactIndex = i; break; }
+  }
+  if (impactIndex === -1) impactIndex = smooth.length - 1;
+
+  const backPx = Math.abs(smooth[backIndex] - startX);
+  const backTime = (ts[backIndex] - ts[startIndex]) / 1000;
+  const fwdTime = (ts[impactIndex] - ts[backIndex]) / 1000;
+
+  if (backTime <= 0 || fwdTime <= 0) return null;
+
+  const ratio = backTime / fwdTime;
+
+  return { backPx, backTime, fwdTime, ratio };
+}
+
+function renderMetrics(m){
+  metricsEl.textContent =
+    `Backstroke: ${m.backPx.toFixed(0)} px | ` +
+    `Tempo: ${m.backTime.toFixed(2)}s / ${m.fwdTime.toFixed(2)}s | ` +
+    `Ratio: ${m.ratio.toFixed(2)}:1`;
+
+  // Coaching nudge
+  if (m.ratio < 1.6) showToast("Tempo looks quick going back. Try a smoother takeaway.");
+  else if (m.ratio > 2.6) showToast("Tempo looks slow going back. Try a slightly firmer through-stroke.");
+  else showToast("Nice tempo range. Try repeating it for 10 strokes.");
+}
+
+function renderSession(){
+  const n = strokes.length;
+  if (n === 0) {
+    sessionEl.textContent = "Strokes: 0 | Consistency: –";
+    return;
+  }
+  // Consistency based on backstroke length std dev (lower = better)
+  const backs = strokes.map(s=>s.backPx);
+  const mean = backs.reduce((a,b)=>a+b,0)/backs.length;
+  const varr = backs.reduce((a,b)=>a+(b-mean)*(b-mean),0)/backs.length;
+  const sd = Math.sqrt(varr);
+
+  // Convert to a rough score out of 100
+  const score = Math.max(0, Math.min(100, 100 - (sd / Math.max(10, mean)) * 220));
+  sessionEl.textContent = `Strokes: ${n} | Consistency: ${score.toFixed(0)}/100`;
+}
+
+function resetSession(){
+  strokes = [];
+  track = [];
+  metricsEl.textContent = "Backstroke: – | Tempo: – | Ratio: –";
+  renderSession();
+  showToast("Session reset.");
+}
+
+function swapCam(){
+  usingFront = !usingFront;
+  roi = null;
+  roiBox.style.display = "none";
+  showToast("Swapping camera…");
+  startCamera();
+}
+
+// ROI selection UI: drag box on screen, convert to video coords
+let settingRoi = false;
+let dragStart = null;
+
+function beginRoi(){
+  if (!video.videoWidth) return;
+  settingRoi = true;
+  dragStart = null;
+  roiBox.style.display = "none";
+  showToast("Drag a box around where the putter head moves.");
+  statusEl.textContent = "SET ROI";
+}
+
+function screenToVideo(x, y){
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const sw = window.innerWidth, sh = window.innerHeight;
+
+  const videoAspect = vw / vh;
+  const screenAspect = sw / sh;
+
+  let drawW, drawH, offX, offY;
+  if (videoAspect > screenAspect) {
+    drawH = sh; drawW = sh * videoAspect;
+    offX = (sw - drawW)/2; offY = 0;
+  } else {
+    drawW = sw; drawH = sw / videoAspect;
+    offX = 0; offY = (sh - drawH)/2;
+  }
+
+  const nx = (x - offX) / drawW;
+  const ny = (y - offY) / drawH;
+
+  return { vx: nx * vw, vy: ny * vh };
+}
+
+function setRoiFromScreenRect(x1,y1,x2,y2){
+  const a = screenToVideo(x1,y1);
+  const b = screenToVideo(x2,y2);
+
+  let rx = Math.min(a.vx, b.vx);
+  let ry = Math.min(a.vy, b.vy);
+  let rw = Math.abs(a.vx - b.vx);
+  let rh = Math.abs(a.vy - b.vy);
+
+  // Clamp
+  const vw = video.videoWidth, vh = video.videoHeight;
+  rx = Math.max(0, Math.min(vw-1, rx));
+  ry = Math.max(0, Math.min(vh-1, ry));
+  rw = Math.max(20, Math.min(vw-rx, rw));
+  rh = Math.max(20, Math.min(vh-ry, rh));
+
+  roi = { x: rx, y: ry, w: rw, h: rh };
+  statusEl.textContent = "LIVE";
+  showToast("ROI set. Tap Analyze Stroke and make one putt.");
+}
+
+function onPointerDown(e){
+  if (!settingRoi) return;
+  const p = getPoint(e);
+  dragStart = p;
+  roiBox.style.display = "block";
+  roiBox.style.left = p.x + "px";
+  roiBox.style.top = p.y + "px";
+  roiBox.style.width = "0px";
+  roiBox.style.height = "0px";
+  e.preventDefault();
+}
+function onPointerMove(e){
+  if (!settingRoi || !dragStart) return;
+  const p = getPoint(e);
+  const x = Math.min(dragStart.x, p.x);
+  const y = Math.min(dragStart.y, p.y);
+  const w = Math.abs(dragStart.x - p.x);
+  const h = Math.abs(dragStart.y - p.y);
+  roiBox.style.left = x + "px";
+  roiBox.style.top = y + "px";
+  roiBox.style.width = w + "px";
+  roiBox.style.height = h + "px";
+  e.preventDefault();
+}
+function onPointerUp(e){
+  if (!settingRoi || !dragStart) return;
+  const p = getPoint(e);
+
+  settingRoi = false;
+  roiBox.style.display = "none";
+
+  // Use drag rect; require minimum size
+  const w = Math.abs(dragStart.x - p.x);
+  const h = Math.abs(dragStart.y - p.y);
+  if (w < 40 || h < 40) {
+    showToast("ROI too small. Try again.");
+    statusEl.textContent = "LIVE";
+    return;
+  }
+
+  setRoiFromScreenRect(dragStart.x, dragStart.y, p.x, p.y);
+  dragStart = null;
+  e.preventDefault();
+}
+
+function getPoint(e){
+  const t = e.touches ? e.touches[0] : e;
+  return { x: t.clientX, y: t.clientY };
+}
+
+startBtn.addEventListener('click', startCamera);
+setRoiBtn.addEventListener('click', beginRoi);
+analyzeBtn.addEventListener('click', analyzeStroke);
+resetBtn.addEventListener('click', resetSession);
+swapBtn.addEventListener('click', swapCam);
+
+window.addEventListener('touchstart', onPointerDown, {passive:false});
+window.addEventListener('touchmove', onPointerMove, {passive:false});
+window.addEventListener('touchend', onPointerUp, {passive:false});
+window.addEventListener('mousedown', onPointerDown);
+window.addEventListener('mousemove', onPointerMove);
+window.addEventListener('mouseup', onPointerUp);
+
+// PWA service worker
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js'));
+}
+
+renderSession();
+</script>
+</body>
+</html>
